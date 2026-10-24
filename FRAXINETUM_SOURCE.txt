@@ -76,6 +76,7 @@ cp native/MainActivity.java "$DEST/MainActivity.java"
 cp native/KeepAlivePlugin.java "$DEST/KeepAlivePlugin.java"
 cp native/CrawlService.java "$DEST/CrawlService.java"
 cp native/NotifyPlugin.java "$DEST/NotifyPlugin.java"
+cp native/BrowserFetchPlugin.java "$DEST/BrowserFetchPlugin.java"
 cp native/PdfWriter.java android/app/src/main/java/android/print/PdfWriter.java
 
 # allow plain-http sites to be archived
@@ -588,6 +589,169 @@ public class NotifyPlugin extends Plugin {
     }
 }
 
+#### FILE: native/BrowserFetchPlugin.java ####
+package app.fraxinetum;
+
+import android.annotation.SuppressLint;
+import android.os.Handler;
+import android.os.Looper;
+import android.webkit.ValueCallback;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.Plugin;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import java.util.concurrent.Semaphore;
+import org.json.JSONArray;
+
+/* Opens a page in a hidden, real WebView (like a browser tab), waits until its text stops changing
+   and returns the final HTML. Used when a plain download comes back empty or blocked, or for sites
+   that build their pages with JavaScript. One page at a time. */
+@CapacitorPlugin(name = "BrowserFetch")
+public class BrowserFetchPlugin extends Plugin {
+    private final Semaphore one = new Semaphore(1);
+    private final Handler ui = new Handler(Looper.getMainLooper());
+
+    @PluginMethod
+    public void get(final PluginCall call) {
+        final String url = call.getString("url", "");
+        final int timeout = call.getInt("timeout", 35000);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    one.acquire();
+                } catch (InterruptedException e) {
+                    call.reject("interrupted");
+                    return;
+                }
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        new Job(call, url, timeout).start();
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private class Job {
+        final PluginCall call;
+        final String url;
+        final int timeout;
+        WebView wv;
+        boolean done = false;
+        int status = 200;
+        int lastLen = -1;
+        int stable = 0;
+        final long t0 = System.currentTimeMillis();
+
+        Job(PluginCall call, String url, int timeout) {
+            this.call = call;
+            this.url = url;
+            this.timeout = timeout;
+        }
+
+        @SuppressLint("SetJavaScriptEnabled")
+        void start() {
+            try {
+                wv = new WebView(getActivity());
+                WebSettings st = wv.getSettings();
+                st.setJavaScriptEnabled(true);
+                st.setDomStorageEnabled(true);
+                st.setLoadsImagesAutomatically(false); // text only: do not download pictures
+                st.setBlockNetworkImage(true);
+                st.setUserAgentString(st.getUserAgentString().replace("; wv", ""));
+                wv.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onReceivedHttpError(WebView v, WebResourceRequest r, WebResourceResponse resp) {
+                        if (r.isForMainFrame()) status = resp.getStatusCode();
+                    }
+
+                    @Override
+                    public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
+                        if (r.isForMainFrame()) finishError("load error: " + e.getDescription());
+                    }
+
+                    @Override
+                    public void onPageStarted(WebView v, String u, android.graphics.Bitmap b) {
+                        status = 200;
+                    }
+                });
+                wv.loadUrl(url);
+                ui.postDelayed(poll, 700);
+            } catch (Exception e) {
+                finishError(String.valueOf(e));
+            }
+        }
+
+        final Runnable poll = new Runnable() {
+            @Override
+            public void run() {
+                if (done) return;
+                final boolean late = System.currentTimeMillis() - t0 > timeout;
+                wv.evaluateJavascript(
+                        "(function(){var b=document.body;return document.readyState+'|'+(b?b.innerText.length:0);})()",
+                        new ValueCallback<String>() {
+                            @Override
+                            public void onReceiveValue(String v) {
+                                if (done) return;
+                                String s = v == null ? "" : v.replace("\"", "");
+                                String[] p = s.split("\\|");
+                                int len = 0;
+                                try { len = Integer.parseInt(p.length > 1 ? p[1] : "0"); } catch (Exception ignored) { }
+                                boolean complete = p.length > 0 && "complete".equals(p[0]);
+                                if (complete && len > 0 && len == lastLen) stable++; else stable = 0;
+                                lastLen = len;
+                                if (stable >= 2 || late) grab(); else ui.postDelayed(poll, 600);
+                            }
+                        });
+            }
+        };
+
+        void grab() {
+            wv.evaluateJavascript("(function(){return document.documentElement.outerHTML;})()", new ValueCallback<String>() {
+                @Override
+                public void onReceiveValue(String v) {
+                    if (done) return;
+                    try {
+                        String html = new JSONArray("[" + v + "]").getString(0);
+                        JSObject res = new JSObject();
+                        res.put("html", html);
+                        res.put("finalUrl", wv.getUrl());
+                        res.put("status", status);
+                        finish();
+                        call.resolve(res);
+                    } catch (Exception e) {
+                        finishError(String.valueOf(e));
+                    }
+                }
+            });
+        }
+
+        void finishError(String msg) {
+            if (done) return;
+            finish();
+            call.reject(msg);
+        }
+
+        void finish() {
+            done = true;
+            try {
+                wv.stopLoading();
+                wv.destroy();
+            } catch (Exception ignored) { }
+            one.release();
+        }
+    }
+}
+
 #### FILE: native/MainActivity.java ####
 package app.fraxinetum;
 
@@ -600,6 +764,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(PrintHtmlPlugin.class);
         registerPlugin(KeepAlivePlugin.class);
         registerPlugin(NotifyPlugin.class);
+        registerPlugin(BrowserFetchPlugin.class);
         super.onCreate(savedInstanceState);
     }
 
@@ -785,13 +950,9 @@ export function resetSettings() {
   applySettings();
 }
 
-/* images make the files heavier, so image modes get smaller parts */
-export function pagesPerPart(mode) {
-  const n = Number(getSettings().partSize) || 1000;
-  if (mode === "text") return n;
-  if (mode === "featured") return Math.max(50, Math.floor(n / 2));
-  if (mode === "auto") return Math.max(50, Math.floor(n / 5));
-  return Math.max(25, Math.floor(n / 10));
+/* how many pages (or messages) go into one output part */
+export function pagesPerPart() {
+  return Number(getSettings().partSize) || 1000;
 }
 
 function prefersDark() {
@@ -829,7 +990,7 @@ try {
 
 #### FILE: src/net.js ####
 /* Native HTTP on Android (CapacitorHttp): no CORS limits, any site can be fetched. */
-import { Capacitor, CapacitorHttp } from "@capacitor/core";
+import { Capacitor, CapacitorHttp, registerPlugin } from "@capacitor/core";
 import { decodeBytes } from "./site.js";
 
 /* politeness: minimum gap between any two requests (also raised by robots.txt Crawl-delay) */
@@ -837,6 +998,7 @@ let minInterval = 500;
 let nextAt = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export function setRate(ms) { minInterval = Math.max(0, Number(ms) || 0); }
+export function getRate() { return minInterval; }
 export function raiseRate(ms) { if (ms > minInterval) minInterval = ms; }
 async function gate() {
   const now = Date.now();
@@ -845,7 +1007,9 @@ async function gate() {
   if (at > now) await sleep(at - now);
 }
 
-const UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36 FRAXINETUM/1.0";
+/* looks like the phone's own browser: many sites refuse requests from unknown tools (the page
+   then comes back empty), but serve the same page to a normal mobile browser */
+const UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -877,7 +1041,7 @@ export async function fetchRaw(url, timeoutMs = 25000, accept = "text/html,appli
   if (Capacitor.isNativePlatform()) {
     const r = await CapacitorHttp.get({
       url,
-      headers: { "User-Agent": UA, Accept: accept, "Accept-Language": "fa,en;q=0.9" },
+      headers: { "User-Agent": UA, Accept: accept, "Accept-Language": "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7", "Upgrade-Insecure-Requests": "1" },
       responseType: "arraybuffer",
       connectTimeout: timeoutMs,
       readTimeout: timeoutMs,
@@ -933,6 +1097,84 @@ export async function fetchJson(url, timeoutMs = 30000) {
   } catch (_e) {
     return null;
   }
+}
+
+/* Android only: load the page in a real (hidden) WebView — like opening it in a browser. It runs the
+   page's JavaScript, keeps cookies and passes the simple "checking your browser" screens. */
+const BrowserFetch = registerPlugin("BrowserFetch");
+export const hasBrowser = () => Capacitor.isNativePlatform();
+
+export async function fetchViaBrowser(url, timeoutMs = 35000) {
+  await gate();
+  const r = await BrowserFetch.get({ url, timeout: timeoutMs });
+  if (r.status >= 400) throw new Error("HTTP " + r.status);
+  return { html: r.html || "", finalUrl: r.finalUrl || url, via: "browser" };
+}
+
+#### FILE: src/fetcher.js ####
+/* One careful way to download an HTML page:
+   - an empty / "checking your browser" / blocked answer is NOT treated as a page without text;
+   - it is retried (slower each time), and the last try opens the page in a real WebView (Android);
+   - the whole crawl slows itself down when a site starts refusing, and stops (instead of marking
+     thousands of pages) when the site clearly blocks us. */
+import { fetchHtml, fetchViaBrowser, hasBrowser, getRate, setRate } from "./net.js";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const CHALLENGE_RE = /(_Incapsula_Resource|incapsula incident|cf-browser-verification|cf-challenge|challenge-platform|just a moment|checking your browser|attention required|access denied|request unsuccessful|px-captcha|g-recaptcha|h-captcha|are you (a )?(human|robot)|ddos-guard|arvancloud|pardon our interruption|bot detection|enable javascript and cookies|you have been blocked|please verify you are|تایید هویت|در حال بررسی مرورگر)/i;
+
+/* "" when the HTML looks like a real page, otherwise a short Persian reason */
+export function blockedReason(html) {
+  const raw = String(html || "");
+  if (!raw.trim()) return "پاسخ سرور خالی بود";
+  const text = raw.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const hasTitle = /<title[^>]*>\s*[^<\s][^<]*<\/title>/i.test(raw);
+  const hasH1 = /<h1[\s>]/i.test(raw);
+  if (CHALLENGE_RE.test(raw.slice(0, 30000)) && text.length < 1500) return "سایت صفحهٔ بررسی یا مسدودسازی ضدربات نشان داد";
+  if (!hasTitle && !hasH1 && text.length < 80) return "سایت پاسخ بدون عنوان و بدون محتوا داد (احتمالاً دسترسی را محدود کرده است)";
+  return "";
+}
+
+export class BlockedAbort extends Error {}
+
+export function makeFetcher(project) {
+  const base = Number(project.delay_ms) || 500;
+  const mode = project.fetch_mode || "auto"; // auto | browser
+  const scale = project.retry_scale == null ? 1 : Number(project.retry_scale); // 1 = real waits (tests use less)
+  const st = { streak: 0, okRun: 0, hardFails: 0, cooled: 0 };
+
+  const noteOk = () => {
+    st.streak = 0; st.hardFails = 0; st.okRun += 1;
+    if (st.okRun >= 20 && getRate() > base) { setRate(Math.max(base, Math.round(getRate() * 0.7))); st.okRun = 0; }
+  };
+  const noteBad = async () => {
+    st.okRun = 0; st.streak += 1;
+    setRate(Math.min(8000, Math.max(getRate(), base) * 1.6));      // slow down
+    if (st.streak >= 6 && st.cooled < 3) { st.cooled += 1; st.streak = 0; await sleep(25000 * scale); } // let the site calm down
+  };
+
+  async function get(url) {
+    let reason = "";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const useBrowser = hasBrowser() && (mode === "browser" || attempt === 2);
+        const res = useBrowser ? await fetchViaBrowser(url) : await fetchHtml(url, 25000);
+        const why = blockedReason(res.html);
+        if (!why) { noteOk(); return res; }
+        reason = why;
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        if (/^HTTP (404|410)\b/.test(msg) || msg === "not-html") throw e; // a real "not found" / not a page: no retry
+        reason = msg;
+      }
+      await noteBad();
+      if (attempt < 2) await sleep((attempt === 0 ? 3000 : 9000) * scale);
+    }
+    st.hardFails += 1;
+    if (st.hardFails >= 8) throw new BlockedAbort("سایت پشت‌سرهم پاسخ خالی یا مسدودکننده می‌دهد؛ ادامه داده نشد تا صفحه‌ها اشتباه «بدون متن» ثبت نشوند. بعداً دوباره امتحان کنید، تأخیر را بیشتر کنید یا «روش دریافت: مرورگر داخلی» را بزنید.");
+    throw new Error(reason || "پاسخ نامعتبر");
+  }
+  return { get };
 }
 
 #### FILE: src/robots.js ####
@@ -1219,7 +1461,6 @@ const ALLOWED = new Set([
   "strong", "b", "em", "i", "u", "br", "hr", "sub", "sup", "dl", "dt", "dd", "mark",
 ]);
 
-const IMG_SKIP_RE = /(logo|icon|sprite|placeholder|blank|spacer|pixel|1x1|favicon|emoji|gravatar|loader|loading)/i;
 
 const MAX_CONTENT = 110000;
 
@@ -1253,15 +1494,35 @@ function textOf(el) {
   return el ? String(el.textContent || "").replace(/\s+/g, " ").trim() : "";
 }
 
-function stripJunk(root) {
+/* strict: class/id based junk removal (sidebars, menus, share buttons…) but NEVER an element that wraps
+   the page's main text or contains the page heading (Elementor/Divi style wrappers are called "widget",
+   "menu-…", "share-enabled"… and used to be deleted together with the whole article).
+   lenient: only structural junk + a short list of names that never wrap an article. */
+const CORE_JUNK_RE = /(^|[-_ ])(sidebar|comments|comment-list|comment-respond|breadcrumb|breadcrumbs|cookie|cookies|popup|modal|newsletter|sharedaddy|sd-sharing|addtoany|a2a_kit|jp-relatedposts|yarpp-related|skip-link|pagination)([-_ ]|$)/i;
+
+function stripJunk(root, mode) {
+  const body = root.querySelector("body") || root;
+  const bodyLen = textLen(body);
   root.querySelectorAll("*").forEach((el) => {
     const tag = tagOf(el);
     if (tag === "form" && textLen(el) > 1500) return; // ASP.NET-style sites wrap the whole page in <form>
     if (DROP_TAGS.has(tag)) {
+      if ((tag === "header" || tag === "footer" || tag === "aside" || tag === "nav") && mode === "lenient" && textLen(el) > 0.6 * bodyLen && bodyLen > 500) return;
       el.remove();
       return;
     }
-    if (isJunk(el) && !/^(html|body|main|article)$/.test(tag)) el.remove();
+    if (/^(html|body|main|article)$/.test(tag)) return;
+    const blob = attrOf(el, "class") + " " + attrOf(el, "id") + " " + attrOf(el, "role");
+    if (mode === "lenient") {
+      if (/(^|\s)(navigation|banner|contentinfo|complementary)(\s|$)/.test(attrOf(el, "role")) || CORE_JUNK_RE.test(blob)) el.remove();
+      return;
+    }
+    if (JUNK_RE.test(blob)) {
+      const len = textLen(el);
+      const wraps = bodyLen > 600 && len > 0.35 * bodyLen;
+      if (wraps || el.querySelector("h1") || /^(content|post|entry|article)/i.test(attrOf(el, "id"))) return; // keep the wrapper, junk inside is still removed
+      el.remove();
+    }
   });
 }
 
@@ -1408,27 +1669,6 @@ function readMeta(root, url) {
   return { title, published, updated, author, description, category, tags: tags.join("، ") };
 }
 
-function imageFrom(el, ctx) {
-  const src = attrOf(el, "data-src") || attrOf(el, "data-lazy-src") || attrOf(el, "data-original") || attrOf(el, "src");
-  let candidate = src;
-  if (!candidate) {
-    const srcset = attrOf(el, "data-srcset") || attrOf(el, "srcset");
-    if (srcset && !/^data:/i.test(srcset)) candidate = srcset.split(",")[0].trim().split(/\s+/)[0];
-  }
-  if (!candidate || /^data:/i.test(candidate)) return null;
-  const abs = normalizeUrl(candidate, ctx.base);
-  if (!abs) return null;
-  if (ctx.seenImg.has(abs)) return null;
-  if (IMG_SKIP_RE.test(abs)) return null;
-  const w = parseInt(attrOf(el, "width") || "0", 10) || 0;
-  const h = parseInt(attrOf(el, "height") || "0", 10) || 0;
-  if ((w && w < 130) || (h && h < 130)) return null;
-  const alt = firstTextOf(attrOf(el, "alt"), attrOf(el, "title"));
-  ctx.seenImg.add(abs);
-  ctx.images.push({ url: abs, alt });
-  return '<img src="' + escapeAttr(abs) + '" alt="' + escapeAttr(alt) + '" />';
-}
-
 function walk(node, ctx, out) {
   const children = node.childNodes || [];
   for (const child of children) {
@@ -1440,30 +1680,14 @@ function walk(node, ctx, out) {
     if (child.nodeType !== 1) continue;
     const tag = tagOf(child);
     if (!tag) continue;
-    if ((DROP_TAGS.has(tag) && !(tag === "form" && textLen(child) > 1500)) || isJunk(child)) continue;
+    if (DROP_TAGS.has(tag) && !(tag === "form" && textLen(child) > 1500)) continue; // class-based junk was already removed by stripJunk()
 
-    if (tag === "img") {
-      const img = imageFrom(child, ctx);
-      if (img) out.push(img);
-      continue;
-    }
-
-    if (tag === "figure" || tag === "picture") {
-      const imgs = child.querySelectorAll("img");
-      let any = false;
-      imgs.forEach((im) => {
-        const rendered = imageFrom(im, ctx);
-        if (rendered) {
-          out.push(rendered);
-          any = true;
-        }
-      });
+    // text only: pictures are never extracted (a figure keeps just its caption)
+    if (tag === "img" || tag === "picture" || tag === "svg" || tag === "video" || tag === "audio" || tag === "canvas") continue;
+    if (tag === "figure") {
       const cap = child.querySelector("figcaption");
-      if (cap && any) {
-        const t = textOf(cap);
-        if (t) out.push("<figcaption>" + escapeHtml(t) + "</figcaption>");
-      }
-      if (!any) walk(child, ctx, out);
+      const t = cap ? textOf(cap) : "";
+      if (t) out.push("<p>" + escapeHtml(t) + "</p>");
       continue;
     }
 
@@ -1521,22 +1745,42 @@ export function plainText(html) {
     .trim();
 }
 
-export function extractPage(html, url) {
+/* one pass: parse -> strip -> pick container -> walk */
+function runPass(html, url, mode) {
   const root = new DOMParser().parseFromString(html, "text/html");
   const meta = readMeta(root, url);
-  stripJunk(root);
-  const container = pickContainer(root);
-
-  const ctx = { images: [], links: [], seenImg: new Set(), seenLink: new Set(), base: url };
+  if (mode === "body") {
+    root.querySelectorAll("script, style, noscript, template, iframe, svg, nav, header, footer, aside").forEach((el) => el.remove());
+  } else {
+    stripJunk(root, mode);
+  }
+  const container = mode === "body" ? root.querySelector("body") || root : pickContainer(root);
+  const ctx = { links: [], seenLink: new Set(), base: url };
   const out = [];
   walk(container, ctx, out);
   let contentHtml = tidy(out.join(""));
-
   const titlePlain = plainText(meta.title);
   const leading = /^\s*<h[12][^>]*>([\s\S]*?)<\/h[12]>/i.exec(contentHtml);
-  if (leading && plainText(leading[1]) === titlePlain) {
-    contentHtml = contentHtml.slice(leading[0].length).trim();
+  if (leading && plainText(leading[1]) === titlePlain) contentHtml = contentHtml.slice(leading[0].length).trim();
+  const plain = plainText(contentHtml);
+  const words = plain ? plain.split(/\s+/).filter(Boolean).length : 0;
+  return { meta, container, ctx, contentHtml, plain, words, mode };
+}
+
+export function extractPage(html, url) {
+  // 1) strict, 2) lenient, 3) whole body text — the first one that yields real text wins, so a page
+  //    that has text is never reported as empty just because of unusual class names.
+  let best = runPass(html, url, "strict");
+  if (best.words < 40) {
+    const lenient = runPass(html, url, "lenient");
+    if (lenient.words > best.words) best = lenient;
   }
+  if (best.words < 25) {
+    const body = runPass(html, url, "body");
+    if (body.words > best.words) best = body;
+  }
+  const { meta, container, ctx, plain, words } = best;
+  let contentHtml = best.contentHtml;
 
   const headings = [];
   container.querySelectorAll("h1, h2, h3, h4").forEach((h) => {
@@ -1549,12 +1793,12 @@ export function extractPage(html, url) {
     contentHtml = contentHtml.slice(0, MAX_CONTENT);
     truncated = true;
   }
-
-  const plain = plainText(contentHtml);
-  const wordCount = plain ? plain.split(/\s+/).filter(Boolean).length : 0;
+  const plainFinal = truncated ? plainText(contentHtml) : plain;
+  const wordCount = truncated ? plainFinal.split(/\s+/).filter(Boolean).length : words;
 
   return {
     title: meta.title || pathOf(url),
+    has_title: !!meta.title,
     author: meta.author || "",
     published_date: meta.published || "",
     updated_date: meta.updated || "",
@@ -1564,12 +1808,13 @@ export function extractPage(html, url) {
     section: sectionOf(url),
     path: pathOf(url),
     headings,
-    images: ctx.images.slice(0, 60),
-    image_count: ctx.images.length,
+    images: [],
+    image_count: 0,
     outbound_links: ctx.links.slice(0, 100),
     content_html: contentHtml,
-    text_preview: plain.slice(0, 700),
+    text_preview: plainFinal.slice(0, 700),
     word_count: wordCount,
+    extract_mode: best.mode,
     truncated,
     status: "extracted",
     links_parsed: true,
@@ -1766,7 +2011,8 @@ export async function openBatterySettings() {
    runExtraction  – download + extract the first N pages (N = ceiling chosen by the user)
    runIncremental – look for NEW / CHANGED pages only, then extract just those
    Politeness: robots.txt (Disallow + Crawl-delay) and a minimum gap between requests. */
-import { fetchHtml, setRate, raiseRate } from "./net.js";
+import { setRate, raiseRate } from "./net.js";
+import { makeFetcher, BlockedAbort } from "./fetcher.js";
 import { collectSitemapUrls, extractLinks, isCrawlable, normalizeUrl, bareHost, pathOf, sectionOf, readSiteName } from "./site.js";
 import { extractPage } from "./extract.js";
 import { loadRobots } from "./robots.js";
@@ -1818,48 +2064,61 @@ async function load(project) {
     await store.savePages(out);
     await store.saveProject(project);
   };
-  return { pages, byUrl, host, origin, robots, st, addPage, flush };
+  const fetcher = makeFetcher(project);
+  project.last_error = "";
+  return { pages, byUrl, host, origin, robots, st, addPage, flush, fetcher };
 }
 
 /* follow internal links of every page that was not scanned yet */
 async function scanUnparsed(c, project, { onProgress, shouldStop }) {
-  const { pages, host, st, addPage, flush } = c;
+  const { pages, host, st, addPage, flush, fetcher } = c;
+  let abortMsg = "";
+  const skipRun = new Set(); // pages that could not be read in this run: retried next time, never treated as "no links"
+  let skipReason = "";
   const scanOne = async (page) => {
     try {
-      const { html, finalUrl } = await fetchHtml(page.url, 25000);
+      const { html, finalUrl } = await fetcher.get(page.url);
       return { page, links: extractLinks(html, finalUrl || page.url, host), html };
-    } catch (_e) {
-      return { page, links: [], html: "" };
+    } catch (e) {
+      if (e instanceof BlockedAbort) { abortMsg = e.message; return { page, links: [], html: "", abort: true }; }
+      const msg = String((e && e.message) || e).slice(0, 160);
+      if (/^HTTP (404|410)\b/.test(msg) || msg === "not-html") return { page, links: [], html: "", dead: msg }; // a real dead link / not a page
+      return { page, links: [], html: "", failed: msg };
     }
   };
   let idx = pages.findIndex((p) => !p.links_parsed);
   if (idx < 0) idx = pages.length;
+  const open = (p) => !p.links_parsed && !skipRun.has(p);
   let scanned = project.scanned || 0;
   let capped = pages.length >= HARD_LIMIT;
 
   while (!shouldStop() && !capped) {
-    while (idx < pages.length && pages[idx].links_parsed) idx += 1;
+    while (idx < pages.length && !open(pages[idx])) idx += 1;
     if (idx >= pages.length) break;
     const batch = [];
-    for (let j = idx; j < pages.length && batch.length < SCAN_BATCH; j++) if (!pages[j].links_parsed) batch.push(pages[j]);
+    for (let j = idx; j < pages.length && batch.length < SCAN_BATCH; j++) if (open(pages[j])) batch.push(pages[j]);
     const results = [];
     let cur = 0;
     await Promise.all(Array.from({ length: Math.min(3, batch.length) }, async () => {
       while (cur < batch.length) results.push(await scanOne(batch[cur++]));
     }));
     for (const r of results) {
+      if (r.abort) continue; // blocked by the site: leave it unscanned so it is tried again later
+      if (r.failed) { skipRun.add(r.page); skipReason = skipReason || r.failed; r.page.discover_error = r.failed; st.dirty.push(r.page); continue; }
       r.page.links_parsed = true;
+      if (r.dead) r.page.discover_error = r.dead;
       st.dirty.push(r.page);
       r.links.forEach((l) => addPage(l, false));
       if (!project.site_name && r.html && r.page.order_index === 0) project.site_name = readSiteName(r.html);
     }
-    scanned += batch.length;
+    scanned += results.filter((r) => !r.abort).length;
     project.scanned = scanned;
     capped = pages.length >= HARD_LIMIT;
+    if (abortMsg) { project.last_error = abortMsg; await flush(); break; }
     await flush();
     onProgress?.({ phase: "discover", discovered: pages.length, scanned });
   }
-  return { capped, finished: capped || !pages.some((p) => !p.links_parsed), scanned };
+  return { capped, finished: !abortMsg && skipRun.size === 0 && (capped || !pages.some((p) => !p.links_parsed)), scanned, skipped: skipRun.size, skipReason };
 }
 
 /* ---------------- phase 1: walk the whole site and count it ---------------- */
@@ -1911,6 +2170,9 @@ export async function runDiscovery(project, opts) {
     if (!project.site_name) project.site_name = project.domain;
   } else {
     project.status = "paused";
+    if (r.skipped && !project.last_error) {
+      project.last_error = `برای ${r.skipped} صفحه پاسخ معتبری دریافت نشد (${r.skipReason}). پیمایش کامل نیست؛ «ادامهٔ پیمایش سایت» را بزنید، یا تأخیر را بیشتر کنید، یا «روش دریافت: مرورگر داخلی» را انتخاب کنید.`;
+    }
   }
   await flush();
   onProgress?.({ phase: "discover", discovered: pages.length, scanned: r.scanned, done: r.finished });
@@ -1921,7 +2183,8 @@ export async function runDiscovery(project, opts) {
 export async function runExtraction(project, { onProgress, shouldStop, retryFailed = false }) {
   await store.requestPersistence();
   const c = await load(project);
-  const { pages, origin, robots, st, flush } = c;
+  const { pages, origin, robots, st, flush, fetcher } = c;
+  let abortMsg = "";
   const target = Math.min(Number(project.max_pages) || 0, pages.length);
   const active = pages.slice(0, target);
 
@@ -1940,9 +2203,12 @@ export async function runExtraction(project, { onProgress, shouldStop, retryFail
 
   const htmlOne = async (page) => {
     try {
-      const { html, finalUrl } = await fetchHtml(page.url, 25000);
-      return { page, ok: true, data: extractPage(html, finalUrl || page.url) };
+      const { html, finalUrl } = await fetcher.get(page.url);
+      const data = extractPage(html, finalUrl || page.url);
+      if (!data.word_count && !data.has_title) return { page, ok: false, error: "سایت پاسخ بدون عنوان و محتوا داد (احتمالاً دسترسی را محدود کرده است)" };
+      return { page, ok: true, data };
     } catch (e) {
+      if (e instanceof BlockedAbort) { abortMsg = e.message; return { page, ok: false, abort: true }; }
       return { page, ok: false, error: String((e && e.message) || e).slice(0, 180) };
     }
   };
@@ -1979,6 +2245,7 @@ export async function runExtraction(project, { onProgress, shouldStop, retryFail
     const contentRows = [];
     for (const r of results) {
       const p = r.page;
+      if (r.abort) continue; // stays "pending" (never written as failed / empty)
       st.dirty.push(p);
       if (!r.ok) { p.status = "failed"; p.error = r.error; failed += 1; continue; }
       const { content_html, outbound_links, text_preview, updated_date, ...meta } = r.data;
@@ -1992,6 +2259,7 @@ export async function runExtraction(project, { onProgress, shouldStop, retryFail
       throw new Error("ذخیرهٔ متن روی گوشی ناموفق بود (شاید حافظه پر است): " + String((e && e.message) || e));
     }
     await sync();
+    if (abortMsg) { project.last_error = abortMsg; break; }
   }
 
   const left = active.some((p) => p.status === "pending");
@@ -2136,13 +2404,6 @@ export function partitionSections(sections, maxPagesPerPart = 1000) {
   return parts;
 }
 
-function imagePolicy(mode) {
-  if (mode === "text") return { inline: false, cap: 0, featured: false };
-  if (mode === "featured") return { inline: false, cap: 0, featured: true };
-  if (mode === "auto") return { inline: true, cap: 8, featured: false };
-  return { inline: true, cap: Infinity, featured: false }; /* "all" */
-}
-
 function renderTable(table, inlineText) {
   const rows = [];
   table.querySelectorAll("tr").forEach((tr) => {
@@ -2157,17 +2418,13 @@ function renderTable(table, inlineText) {
 }
 
 /* render the extracted content as clean block-level HTML: headings, paragraphs,
-   lists, blockquotes, tables and images. inline tags (strong/em/a) are flattened
+   lists, blockquotes and tables (text only: no pictures). inline tags (strong/em/a) are flattened
    to their text so the reader sees plain readable text — never tag soup. */
-export function renderArticleBody(contentHtml, { imageMode, page }) {
+export function renderArticleBody(contentHtml) {
   if (!contentHtml || !contentHtml.trim()) return "";
   const doc = new DOMParser().parseFromString(`<div id="__r">${contentHtml}</div>`, "text/html");
   const root = doc.getElementById("__r");
   if (!root) return "";
-
-  const policy = imagePolicy(imageMode);
-  const imageSet = new Set((page.images || []).map((i) => i.url));
-  let imgCount = 0;
 
   const inlineText = (node) => {
     let s = "";
@@ -2192,17 +2449,8 @@ export function renderArticleBody(contentHtml, { imageMode, page }) {
       if (child.nodeType !== 1) return;
       const tag = child.tagName;
 
-      if (tag === "IMG") {
-        if (policy.inline && imgCount < policy.cap) {
-          const src = child.getAttribute("src") || "";
-          if (src && (!imageSet.size || imageSet.has(src))) {
-            out.push(`<img src="${esc(src)}" alt="${esc(child.getAttribute("alt") || "")}"/>`);
-            imgCount += 1;
-          }
-        }
-        return;
-      }
-      if (tag === "FIGURE" || tag === "PICTURE") { walk(child); return; }
+      if (tag === "IMG" || tag === "PICTURE" || tag === "SVG" || tag === "VIDEO" || tag === "AUDIO" || tag === "CANVAS") return;
+      if (tag === "FIGURE") { walk(child); return; }
       if (tag === "BR") { out.push("<br/>"); return; }
       if (tag === "UL" || tag === "OL") {
         const items = [];
@@ -2229,24 +2477,18 @@ export function renderArticleBody(contentHtml, { imageMode, page }) {
   }
   walk(root);
 
-  let body = out.join("").replace(/<(p|li|ul|ol|blockquote|h[1-6]|td|th|table)>/g, '<$1 dir="auto">');
-  if (policy.featured) {
-    const fi = (page.images || [])[0];
-    if (fi && fi.url) {
-      body = `<img class="featured" src="${esc(fi.url)}" alt="${esc(fi.alt || page.title || "")}"/>` + body;
-    }
-  }
+  const body = out.join("").replace(/<(p|li|ul|ol|blockquote|h[1-6]|td|th|table)>/g, '<$1 dir="auto">');
   return body;
 }
 
-function articleHtml(page, number, imageMode) {
+function articleHtml(page, number) {
   const meta = [];
   if (page.published_date) meta.push("تاریخ انتشار: " + formatFaDate(page.published_date));
   if (page.author) meta.push("نویسنده: " + esc(page.author));
   if (page.category) meta.push("دسته: " + esc(page.category));
   meta.push("کلمات: " + faNum(page.word_count || 0));
 
-  const body = renderArticleBody(page.__content || "", { imageMode, page });
+  const body = renderArticleBody(page.__content || "");
   const empty = !body.trim();
   const emptyNote = page.status === "failed"
     ? "استخراج این صفحه ناموفق بود" + (page.error ? ": " + esc(page.error) : "")
@@ -2270,8 +2512,6 @@ function styles() {
     "h1,h2,h3{line-height:1.6;color:#123f39}" +
     "p{margin:0 0 9pt}" +
     "a{color:#17625a;text-decoration:none}" +
-    "img{max-width:480px;height:auto;border-radius:6px;margin:6px 0}" +
-    "img.featured{max-width:360px}" +
     "blockquote{border-inline-start:3px solid #cbb894;padding:2px 12px;margin:10px 0;color:#3b4a47;background:#faf7f1}" +
     "table{border-collapse:collapse;width:100%;margin:10px 0}" +
     "td,th{border:1px solid #cfd6d4;padding:6px 8px;font-size:10.5pt}" +
@@ -2301,7 +2541,7 @@ function styles() {
     ".tocpage h3{margin:12px 0 4px;font-size:13pt}.tocpage ol{list-style:none;padding:0;margin:0}.tocpage li{margin:2px 0;font-size:10.5pt;text-align:start}" +
     ".empty{color:#8a9492;font-style:italic;font-size:10.5pt}" +
     "@page{size:A4;margin:16mm 14mm}" +
-    "figure,img,blockquote,pre,table{page-break-inside:avoid}"
+    "blockquote,pre,table{page-break-inside:avoid}"
   );
 }
 
@@ -2318,7 +2558,7 @@ function wrapHtml(title, bodyInner) {
   );
 }
 
-export function buildPartHtml({ project, parts, partIndex, imageMode }) {
+export function buildPartHtml({ project, parts, partIndex }) {
   const part = parts[partIndex];
   const partCount = parts.length;
   const siteName = project.site_name || project.domain || project.site_url;
@@ -2327,7 +2567,7 @@ export function buildPartHtml({ project, parts, partIndex, imageMode }) {
   const chapters = part.groups
     .map((g, gi) => {
       const head = `<h1 class="chapter" id="g${partIndex}_${gi}">${esc(g.label)}<small>${faNum(g.pages.length)} صفحه در این بخش</small></h1>`;
-      const body = g.pages.map((p) => articleHtml(p, p.globalNumber, imageMode)).join("");
+      const body = g.pages.map((p) => articleHtml(p, p.globalNumber)).join("");
       return head + body;
     })
     .join("");
@@ -2400,7 +2640,7 @@ function csvCell(v) {
 }
 
 export function buildPagesCsv(pages) {
-  const header = ["ردیف", "عنوان", "نشانی", "بخش", "دسته", "تاریخ انتشار", "نویسنده", "کلمات", "تعداد تصاویر", "وضعیت"];
+  const header = ["ردیف", "عنوان", "نشانی", "بخش", "دسته", "تاریخ انتشار", "نویسنده", "کلمات", "وضعیت"];
   const rows = pages.map((p, i) => [
     i + 1,
     p.title || "",
@@ -2410,7 +2650,6 @@ export function buildPagesCsv(pages) {
     p.published_date || "",
     p.author || "",
     p.word_count || 0,
-    p.image_count || 0,
     p.status === "extracted" ? "استخراج شد" : p.status === "failed" ? "ناموفق" : "در انتظار",
   ]);
   return "\uFEFF" + [header, ...rows].map((r) => r.map(csvCell).join(",")).join("\r\n") + "\r\n";
@@ -2435,7 +2674,7 @@ export function downloadFile(content, filename, mime) {
    Persian/RTL: every paragraph is bidirectional and every run is right-to-left. */
 import {
   Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell,
-  WidthType, ImageRun, ExternalHyperlink, AlignmentType, Bookmark, InternalHyperlink, CharacterSet, LineRuleType,
+  WidthType, ExternalHyperlink, AlignmentType, Bookmark, InternalHyperlink, CharacterSet, LineRuleType,
 } from "docx";
 import JSZip from "jszip";
 import { fontBytes, PERSIAN_FONT, LATIN_FONT } from "./fonts.js";
@@ -2496,50 +2735,6 @@ function cleanText(node) {
   return s.replace(/\s+/g, " ").trim();
 }
 
-/* ---------- images (best effort: needs the image host to allow CORS) ---------- */
-export async function loadImage(url) {
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 9000);
-  try {
-    const res = await fetch(url, { signal: ctl.signal, mode: "cors" });
-    if (!res.ok) return null;
-    let blob = await res.blob();
-    if (blob.size > 4_000_000 || blob.size < 200) return null;
-    let type = (blob.type || "").toLowerCase();
-    const bmp = await createImageBitmap(blob);
-    let w = bmp.width;
-    let h = bmp.height;
-    if (!/image\/(png|jpe?g)/.test(type)) {
-      // webp / gif / svg / bmp -> png through a canvas
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      canvas.getContext("2d").drawImage(bmp, 0, 0);
-      blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
-      type = "image/png";
-      if (!blob) return null;
-    }
-    const data = new Uint8Array(await blob.arrayBuffer());
-    const maxW = 420;
-    if (w > maxW) { h = Math.round((h * maxW) / w); w = maxW; }
-    return { data, type: /png/.test(type) ? "png" : "jpg", width: w, height: h };
-  } catch (_e) {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function imageParagraph(src, alt, stats) {
-  const img = await loadImage(src);
-  if (!img) { stats.skipped += 1; return null; }
-  stats.embedded += 1;
-  return para(
-    new ImageRun({ type: img.type, data: img.data, transformation: { width: img.width, height: img.height }, altText: { title: alt || "image", description: alt || "image", name: "image" } }),
-    { center: true },
-  );
-}
-
 /* ---------- article HTML -> docx blocks ---------- */
 function tableBlock(tableEl, def) {
   const rows = [];
@@ -2571,17 +2766,13 @@ function tableBlock(tableEl, def) {
   });
 }
 
-async function bodyBlocks(contentHtml, page, imageMode, stats) {
+async function bodyBlocks(contentHtml) {
   if (!contentHtml || !contentHtml.trim()) return [];
   const doc = new DOMParser().parseFromString(`<div id="__r">${contentHtml}</div>`, "text/html");
   const root = doc.getElementById("__r");
   if (!root) return [];
   const def = detectRtl(cleanText(root), true);
 
-  const allowImg = imageMode === "auto" || imageMode === "all";
-  const cap = imageMode === "auto" ? 8 : Infinity;
-  const known = new Set((page.images || []).map((i) => i.url));
-  let imgCount = 0;
   const out = [];
 
   const walk = async (node) => {
@@ -2593,18 +2784,8 @@ async function bodyBlocks(contentHtml, page, imageMode, stats) {
       }
       if (child.nodeType !== 1) continue;
       const tag = child.tagName;
-      if (tag === "IMG") {
-        if (allowImg && imgCount < cap) {
-          const src = child.getAttribute("src") || "";
-          if (src && (!known.size || known.has(src))) {
-            imgCount += 1;
-            const p = await imageParagraph(src, child.getAttribute("alt"), stats);
-            if (p) out.push(p);
-          }
-        }
-        continue;
-      }
-      if (tag === "FIGURE" || tag === "PICTURE") { await walk(child); continue; }
+      if (tag === "IMG" || tag === "PICTURE" || tag === "SVG" || tag === "VIDEO" || tag === "AUDIO" || tag === "CANVAS") continue; // text only
+      if (tag === "FIGURE") { await walk(child); continue; }
       if (tag === "UL" || tag === "OL") {
         let n = 0;
         child.querySelectorAll(":scope > li").forEach((li) => {
@@ -2640,7 +2821,7 @@ async function bodyBlocks(contentHtml, page, imageMode, stats) {
   return out;
 }
 
-async function articleBlocks(page, number, imageMode, stats) {
+async function articleBlocks(page, number) {
   const title = page.title || page.path || page.url;
   const pageRtl = detectRtl((page.__content || "").replace(/<[^>]*>/g, " "), true);
   const titleRtl = detectRtl(title, pageRtl);
@@ -2662,7 +2843,7 @@ async function articleBlocks(page, number, imageMode, stats) {
   blocks.push(para(run(meta.join("  •  "), { size: 19, color: "5D6B68" }), { after: 100 }));
   if (page.description) { const dr = detectRtl(page.description, pageRtl); blocks.push(para(run(page.description, { color: "3B4A47", italics: true, rtl: dr }), { indent: { start: 240 }, rtl: dr })); }
 
-  const body = await bodyBlocks(page.__content || "", page, imageMode, stats);
+  const body = await bodyBlocks(page.__content || "");
   if (body.length) blocks.push(...body);
   else {
     const note = page.status === "failed"
@@ -2674,12 +2855,11 @@ async function articleBlocks(page, number, imageMode, stats) {
 }
 
 /* ---------- whole part -> Blob ---------- */
-export async function buildDocxBlob({ project, parts, partIndex, imageMode, onProgress }) {
+export async function buildDocxBlob({ project, parts, partIndex, onProgress }) {
   const part = parts[partIndex];
   const siteName = project.site_name || project.domain || project.site_url;
   const downloaded = faLongDate(project.finished || project.created);
   const totalPages = parts.reduce((n, pp) => n + pp.pageCount, 0);
-  const stats = { embedded: 0, skipped: 0 };
 
   const children = [
     para(run("بسم الله الرحمن الرحیم", { bold: true, size: 44, color: "123F39" }), { center: true, before: 500, after: 60 }),
@@ -2724,7 +2904,7 @@ export async function buildDocxBlob({ project, parts, partIndex, imageMode, onPr
       para(run(`${faNum(g.pages.length)} صفحه در این بخش`, { size: 21, color: "5D6B68" })),
     );
     for (const p of g.pages) {
-      children.push(...(await articleBlocks(p, p.globalNumber, imageMode, stats)));
+      children.push(...(await articleBlocks(p, p.globalNumber)));
       done += 1;
       if (done % 5 === 0) {
         onProgress?.(done, total);
@@ -2745,7 +2925,7 @@ export async function buildDocxBlob({ project, parts, partIndex, imageMode, onPr
     }],
   });
   const blob = await fixEmbeddedFont(await Packer.toBlob(doc));
-  return { blob, stats };
+  return { blob };
 }
 
 /* The docx library stores an embedded font whose name contains a dot ("Far.Nazanin") as
@@ -2789,8 +2969,8 @@ export function downloadBlob(blob, filename) {
 import JSZip from "jszip";
 import { fontBytes } from "./fonts.js";
 import { renderArticleBody } from "./documentBuilder.js";
-import { loadImage, detectRtl } from "./docxBuilder.js";
-import { prepImage, when, monthOf, notes } from "./tgExport.js";
+import { detectRtl } from "./docxBuilder.js";
+import { when, monthOf, notes } from "./tgExport.js";
 import { faNum, faLongDate, formatFaDate } from "./format.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -2800,7 +2980,6 @@ body{font-family:'FxPersian','Times New Roman',serif;line-height:1.8;margin:0 4%
 p,li,blockquote{text-align:justify;margin:0 0 .7em}
 h1,h2,h3{line-height:1.5;color:#123f39}
 h1{font-size:1.5em;border-bottom:2px solid #123f39}
-img{max-width:100%;height:auto;display:block;margin:.6em auto}
 .url{direction:ltr;text-align:left;font-size:.75em;color:#777;word-break:break-all}
 .meta,.note{font-size:.8em;color:#666}
 .cover{text-align:center;margin-top:20%}
@@ -2820,14 +2999,13 @@ function pageDoc(title, lang, rtl, body) {
 }
 
 /* chapters: [{ file, title, body, nav: 0|1 (1 = nested under the previous nav 0 entry) }] */
-async function makeEpub({ title, lang, rtl, chapters, images }) {
+async function makeEpub({ title, lang, rtl, chapters }) {
   const zip = new JSZip();
   zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
   zip.file("META-INF/container.xml", `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`);
   zip.file("OEBPS/style.css", CSS);
   zip.file("OEBPS/fonts/persian.ttf", fontBytes());
   chapters.forEach((c) => zip.file("OEBPS/" + c.file, pageDoc(c.title, lang, rtl, c.body)));
-  images.forEach((im) => zip.file("OEBPS/images/" + im.name, im.data));
 
   const id = "urn:uuid:" + crypto.randomUUID();
   const items = [
@@ -2836,7 +3014,6 @@ async function makeEpub({ title, lang, rtl, chapters, images }) {
     `<item id="css" href="style.css" media-type="text/css"/>`,
     `<item id="font" href="fonts/persian.ttf" media-type="font/ttf"/>`,
     ...chapters.map((c, i) => `<item id="c${i}" href="${c.file}" media-type="application/xhtml+xml"/>`),
-    ...images.map((im, i) => `<item id="i${i}" href="images/${im.name}" media-type="${im.mime}"/>`),
   ].join("");
   zip.file("OEBPS/content.opf",
     `<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid" xml:lang="${lang}">` +
@@ -2867,15 +3044,13 @@ const coverBody = (project, name, total, label, extra) =>
   `<p>${label}: ${faNum(total)}</p><p class="fx">تهیه شده توسط اپ فراکسینتوم</p>${extra || ""}</div>`;
 
 /* ---------------- website ---------------- */
-export async function buildSiteEpub({ project, parts, partIndex, imageMode, onProgress }) {
+export async function buildSiteEpub({ project, parts, partIndex, onProgress }) {
   const part = parts[partIndex];
   const name = project.site_name || project.domain || project.site_url;
   const sample = part.groups.flatMap((g) => g.pages).slice(0, 25).map((p) => p.title || "").join(" ");
   const rtl = detectRtl(sample, true);
   const total = parts.reduce((n, p) => n + p.pageCount, 0);
   const chapters = [{ file: "cover.xhtml", title: name, nav: 0, body: coverBody(project, name, total, "تعداد صفحات", parts.length > 1 ? `<p>بخش ${faNum(partIndex + 1)} از ${faNum(parts.length)}</p>` : "") }];
-  const images = [];
-  const wantImg = imageMode !== "text";
   let done = 0;
   const all = part.groups.reduce((n, g) => n + g.pages.length, 0);
 
@@ -2883,17 +3058,7 @@ export async function buildSiteEpub({ project, parts, partIndex, imageMode, onPr
     chapters.push({ file: `g${gi}.xhtml`, title: g.label, nav: 0, body: `<h1 dir="auto">${esc(g.label)}</h1><p class="note">${faNum(g.pages.length)} صفحه</p>` });
     for (const p of g.pages) {
       const num = p.globalNumber;
-      const d = new DOMParser().parseFromString(`<div id="r">${renderArticleBody(p.__content || "", { imageMode, page: p })}</div>`, "text/html");
-      const root = d.getElementById("r");
-      for (const img of Array.from(root.querySelectorAll("img"))) {
-        const src = img.getAttribute("src") || "";
-        const got = wantImg && src ? await loadImage(src) : null;
-        if (!got) { img.remove(); continue; }
-        const nm = `i${images.length}.${got.type === "png" ? "png" : "jpg"}`;
-        images.push({ name: nm, data: got.data, mime: got.type === "png" ? "image/png" : "image/jpeg" });
-        img.setAttribute("src", "images/" + nm);
-        img.removeAttribute("class");
-      }
+      const bodyHtml = renderArticleBody(p.__content || "");
       const meta = [];
       if (p.published_date) meta.push("تاریخ انتشار: " + formatFaDate(p.published_date));
       if (p.author) meta.push("نویسنده: " + p.author);
@@ -2901,23 +3066,22 @@ export async function buildSiteEpub({ project, parts, partIndex, imageMode, onPr
       const title = p.title || p.path || p.url;
       const body = `<h2 dir="auto">${faNum(num)}. ${esc(title)}</h2><p class="url">${esc(p.url)}</p>` +
         (meta.length ? `<p class="meta">${esc(meta.join(" • "))}</p>` : "") +
-        (root.innerHTML.trim() ? toXhtml(root.innerHTML) : `<p class="note">این صفحه متن قابل‌استخراجی نداشت.</p>`);
+        (bodyHtml.trim() ? toXhtml(bodyHtml) : `<p class="note">${p.status === "failed" ? "استخراج این صفحه ناموفق بود." : "این صفحه متن قابل‌استخراجی نداشت."}</p>`);
       chapters.push({ file: `a${num}.xhtml`, title: `${faNum(num)}. ${String(title).slice(0, 120)}`, nav: 1, body });
       done += 1;
       if (done % 5 === 0) { onProgress?.(done, all); await new Promise((r) => setTimeout(r, 0)); }
     }
   }
-  return makeEpub({ title: name, lang: rtl ? "fa" : "en", rtl, chapters, images });
+  return makeEpub({ title: name, lang: rtl ? "fa" : "en", rtl, chapters });
 }
 
 /* ---------------- Telegram channel ---------------- */
-export async function buildTgEpub({ project, parts, partIndex, media, onProgress }) {
+export async function buildTgEpub({ project, parts, partIndex, onProgress }) {
   const part = parts[partIndex];
   const name = project.site_name || project.tg_user;
   const rtl = detectRtl(part.msgs.slice(0, 30).map((m) => m.text).join(" "), true);
   const total = parts.reduce((n, p) => n + p.msgs.length, 0);
   const chapters = [{ file: "cover.xhtml", title: name, nav: 0, body: coverBody(project, name, total, "تعداد پیام‌ها", parts.length > 1 ? `<p>بخش ${faNum(partIndex + 1)} از ${faNum(parts.length)}</p>` : "") }];
-  const images = [];
   let cur = null, curMonth = "", count = 0, ci = 0, done = 0;
   const flushCh = () => { if (cur) chapters.push(cur); cur = null; };
 
@@ -2934,20 +3098,12 @@ export async function buildTgEpub({ project, parts, partIndex, media, onProgress
     String(m.text || "").split("\n").forEach((line) => { if (line.trim()) h += `<p dir="auto">${esc(line.trim())}</p>`; });
     notes(m).forEach((n) => { h += `<p class="note">${esc(n)}</p>`; });
     if (m.link && (m.link.title || m.link.url)) h += `<p dir="auto"><b>${esc(m.link.title)}</b><br/><span class="url">${esc(m.link.url)}</span></p>`;
-    for (const ph of m.photos || []) {
-      const e = media[ph.key];
-      const im = e ? await prepImage(e.buf, e.type) : null;
-      if (!im) continue;
-      const nm = `i${images.length}.${im.type === "png" ? "png" : "jpg"}`;
-      images.push({ name: nm, data: im.data, mime: im.type === "png" ? "image/png" : "image/jpeg" });
-      h += `<img src="images/${nm}" alt=""/>`;
-    }
     cur.body += h + `<hr/>`;
     done += 1;
     if (done % 20 === 0) { onProgress?.(done, part.msgs.length); await new Promise((r) => setTimeout(r, 0)); }
   }
   flushCh();
-  return makeEpub({ title: name, lang: rtl ? "fa" : "en", rtl, chapters, images });
+  return makeEpub({ title: name, lang: rtl ? "fa" : "en", rtl, chapters });
 }
 
 #### FILE: src/export.js ####
@@ -3159,22 +3315,22 @@ export function aboutHtml() {
     <li>نشانی سایت را در صفحهٔ اصلی بنویسید و «پیمایش سایت و شمارش صفحات» را بزنید.</li>
     <li>برنامه کل سایت را می‌گردد (از راه API وردپرس، نقشهٔ سایت یا دنبال‌کردن لینک‌ها) و تعداد کل صفحات را می‌شمارد.</li>
     <li>سقف تعداد صفحات را انتخاب کنید: همهٔ صفحات یا ۵۰۰ تا ۵۰۰٬۰۰۰ صفحه، و «شروع استخراج» را بزنید.</li>
-    <li>متن مقاله‌ها (و در صورت انتخاب، تصاویر) روی گوشی ذخیره می‌شود. می‌توانید هر زمان توقف کنید و بعداً ادامه بدهید.</li>
+    <li>فقط متن مقاله‌ها روی گوشی ذخیره می‌شود (تصویر دانلود نمی‌شود). می‌توانید هر زمان توقف کنید و بعداً ادامه بدهید.</li>
     <li>«آماده‌سازی خروجی» را بزنید. فایل به بخش‌هایی با حداکثر اندازهٔ مجاز تقسیم می‌شود (مثلاً ۵۰۰۰ صفحه با سقف ۱۰۰۰ صفحه = ۵ بخش ۱۰۰۰تایی) و هر بخش را جدا به‌صورت Word، PDF یا EPUB می‌گیرید.</li>
   </ul>
 
   <h3>نحوهٔ کار با کانال تلگرام</h3>
   <ul class="fx">
     <li>در صفحهٔ اصلی تب «کانال تلگرام» را بزنید و نشانی کانال عمومی را بنویسید.</li>
-    <li>پیام‌ها (و در صورت انتخاب، عکس‌ها) از جدید به قدیم دانلود می‌شوند و در خروجی از قدیم به جدید و به‌ترتیب ماه چیده می‌شوند.</li>
-    <li>فقط کانال‌های عمومی دارای پیش‌نمایش وب پشتیبانی می‌شوند؛ کانال خصوصی نه. ویدیوها دانلود نمی‌شوند و فقط تصویر بندانگشتی‌شان می‌آید.</li>
+    <li>متن پیام‌ها از جدید به قدیم دانلود می‌شوند و در خروجی از قدیم به جدید و به‌ترتیب ماه چیده می‌شوند.</li>
+    <li>فقط کانال‌های عمومی دارای پیش‌نمایش وب پشتیبانی می‌شوند؛ کانال خصوصی نه. عکس و ویدیو دانلود نمی‌شوند.</li>
   </ul>
 
   <h3>امکانات</h3>
   <ul class="fx">
     <li>شمارش کامل سایت پیش از شروع، و انتخاب سقف صفحات.</li>
     <li>مسیر سریع و تمیز برای سایت‌های وردپرسی.</li>
-    <li>رعایت robots.txt و تأخیر قابل‌تنظیم بین درخواست‌ها تا به سایت فشار نیاید.</li>
+    <li>رعایت robots.txt و تأخیر قابل‌تنظیم بین درخواست‌ها تا به سایت فشار نیاید. اگر سایتی پاسخ خالی یا مسدودکننده بدهد، برنامه خودش کندتر می‌شود، دوباره تلاش می‌کند و در اندروید در صورت نیاز صفحه را با مرورگر داخلی باز می‌کند؛ چنین صفحه‌ای هرگز به‌اشتباه «بدون متن» ثبت نمی‌شود.</li>
     <li>به‌روزرسانی افزایشی: فقط صفحه‌ها و پیام‌های تازه یا تغییرکرده را می‌گیرد.</li>
     <li>ادامهٔ کارهای ناتمام، و اجرا در پس‌زمینه با اعلان.</li>
     <li>Word با فهرست مطالب قابل‌کلیک، تراز دوطرفه، جهت خودکار فارسی (راست‌به‌چپ) و انگلیسی (چپ‌به‌راست)، فونت فارسی جاسازی‌شده و Times New Roman برای انگلیسی؛ همچنین PDF و EPUB.</li>
@@ -3209,7 +3365,7 @@ export function settingsHtml() {
 
   <h3>خروجی</h3>
   <div class="setrow"><label>حداکثر صفحه (یا پیام) در هر بخش</label>${sel("partSize", s.partSize, [[200, "۲۰۰"], [500, "۵۰۰"], [1000, "۱۰۰۰ (پیش‌فرض)"], [2000, "۲۰۰۰"], [5000, "۵۰۰۰"]])}
-  <div class="mut" style="margin-top:6px">بخش‌ها تا همین سقف پُر می‌شوند. اگر تصاویر را هم بگیرید، این سقف خودکار کوچک‌تر می‌شود تا فایل سنگین نشود. برای PDF روی گوشی، سقف کمتر سریع‌تر است.</div></div>
+  <div class="mut" style="margin-top:6px">بخش‌ها تا همین سقف پُر می‌شوند. برای PDF روی گوشی، سقف کمتر سریع‌تر ساخته می‌شود.</div></div>
 
   <h3>پیمایش</h3>
   <div class="setrow"><label>تأخیر پیش‌فرض بین درخواست‌ها</label>${sel("delay", s.delay, [[500, "کم — نیم ثانیه"], [1000, "متوسط — ۱ ثانیه"], [2000, "زیاد — ۲ ثانیه"]])}</div>
@@ -3250,7 +3406,7 @@ export function storageHtml(est, projects) {
     ? projects.map((p) => `<div class="row between" style="padding:8px 0;border-bottom:1px solid var(--bd)"><div class="grow" style="min-width:0"><div class="title">${esc(p.site_name || p.domain)}</div><div class="mut">${p.kind === "tg" ? `${faNum(p.tg_count || 0)} پیام` : `${faNum(p.extracted || 0)} صفحه`}</div></div><button class="dan" data-act="del" data-id="${p.id}">حذف</button></div>`).join("")
     : `<p class="mut">پروژه‌ای ذخیره نشده است.</p>`;
   return `<div class="card"><h2>حافظه و پروژه‌ها</h2>${usage}
-  <div class="note">متن و عکس‌های آرشیو فقط روی همین گوشی است. اگر داده‌های برنامه را از تنظیمات اندروید پاک کنید یا برنامه را حذف کنید، پروژه‌ها از بین می‌روند؛ فایل‌های ساخته‌شده در پوشهٔ Download می‌مانند.</div></div>
+  <div class="note">متن‌های آرشیو فقط روی همین گوشی است. اگر داده‌های برنامه را از تنظیمات اندروید پاک کنید یا برنامه را حذف کنید، پروژه‌ها از بین می‌روند؛ فایل‌های ساخته‌شده در پوشهٔ Download می‌مانند.</div></div>
   <div class="card"><h3 style="margin-top:0">پروژه‌ها</h3>${rows}</div>
   <div class="card"><h3 style="margin-top:0">سابقهٔ دانلودها</h3><button class="sec" data-act="dl-clear">پاک کردن سابقهٔ فهرست دانلودها</button><div class="mut" style="margin-top:6px">فایل‌های داخل پوشهٔ Download پاک نمی‌شوند.</div></div>`;
 }
@@ -3272,8 +3428,8 @@ export function privacyHtml() {
   return `<div class="card"><h2>حریم خصوصی و نکات حقوقی</h2>
   <h3 style="margin-top:0">داده‌های شما</h3>
   <ul class="fx">
-    <li>فراکسینتوم سروری ندارد و هیچ داده‌ای برای ما ارسال نمی‌شود. متن‌ها، عکس‌ها، پروژه‌ها و تنظیمات فقط روی همین گوشی می‌مانند.</li>
-    <li>برنامه فقط به سایت یا کانالی که خودتان وارد می‌کنید درخواست می‌فرستد، و برای بررسی نسخهٔ جدید به GitHub.</li>
+    <li>فراکسینتوم سروری ندارد و هیچ داده‌ای برای ما ارسال نمی‌شود. متن‌ها، پروژه‌ها و تنظیمات فقط روی همین گوشی می‌مانند.</li>
+    <li>برنامه فقط به سایت یا کانالی که خودتان وارد می‌کنید درخواست می‌فرستد، و برای بررسی نسخهٔ جدید به GitHub. درخواست‌ها را مثل مرورگر موبایل خود گوشی ارسال می‌کند.</li>
     <li>با حذف پروژه یا پاک کردن داده‌های برنامه، آرشیو پاک می‌شود. فایل‌های داخل پوشهٔ Download را خودتان مدیریت می‌کنید.</li>
   </ul>
   <h3>نکات حقوقی</h3>
@@ -3323,9 +3479,9 @@ export async function openUrl(url) {
 
 #### FILE: src/telegram.js ####
 /* Public Telegram channels, read from the official web preview (t.me/s/<name>):
-   text, dates, forwarded-from and photos. Works without login; does NOT work for
+   text, dates and forwarded-from (text only: pictures are not downloaded). Works without login; does NOT work for
    private channels or channels whose web preview is disabled. */
-import { fetchHtml, fetchRaw, setRate } from "./net.js";
+import { fetchHtml, setRate } from "./net.js";
 import * as store from "./store.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -3407,17 +3563,6 @@ async function getPage(username, before) {
   throw lastErr;
 }
 
-async function downloadPhoto(url) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await fetchRaw(url, 30000, "image/*", { gate: false });
-      if (r.status === 200 && r.bytes.length > 400) return r;
-    } catch (_e) { /* retry */ }
-    await sleep(1200);
-  }
-  return null;
-}
-
 export async function runTelegram(project, { onProgress, shouldStop, incremental = false }) {
   await store.requestPersistence();
   setRate(project.delay_ms || 700);
@@ -3431,7 +3576,6 @@ export async function runTelegram(project, { onProgress, shouldStop, incremental
   }
   let before = incremental ? 0 : project.tg_before || 0;
   let count = project.tg_count || 0;
-  let photos = project.tg_photos || 0;
   project.status = "downloading";
   let finished = false;
   let first = !incremental && !project.tg_started;
@@ -3459,21 +3603,8 @@ export async function runTelegram(project, { onProgress, shouldStop, incremental
         id: `${project.id}|${m.msg_id}`, project_id: project.id, kind: "tg", order_index: m.msg_id,
         msg_id: m.msg_id, date: m.date, text: m.text, fwd: m.fwd, views: m.views, video: m.video,
         voice: m.voice, sticker: m.sticker, file: m.file, poll: m.poll, link: m.link, unsupported: m.unsupported,
-        photos: [], media_bytes: 0, status: "extracted",
+        has_photo: m.photo_urls.length > 0 && !m.video, status: "extracted",
       };
-      if (project.tg_media && m.photo_urls.length) {
-        let i = 0;
-        for (const u of m.photo_urls) {
-          const r = await downloadPhoto(u);
-          if (!r) continue;
-          const key = `${project.id}|${m.msg_id}|${i++}`;
-          const type = /png/i.test(r.contentType) ? "image/png" : /webp/i.test(r.contentType) ? "image/webp" : "image/jpeg";
-          await store.putMedia(key, r.bytes.buffer, type);
-          rec.photos.push({ key, type, size: r.bytes.length });
-          rec.media_bytes += r.bytes.length;
-          photos += 1;
-        }
-      }
       records.push(rec);
     }
     await store.savePages(records);
@@ -3482,10 +3613,10 @@ export async function runTelegram(project, { onProgress, shouldStop, incremental
     const oldest = Math.min(...msgs.map((m) => m.msg_id));
     const oldestDate = msgs.find((m) => m.msg_id === oldest)?.date || "";
     before = oldest;
-    if (incremental) Object.assign(project, { tg_count: count, tg_photos: photos, updated: Date.now() });
-    else Object.assign(project, { tg_before: oldest, tg_count: count, tg_photos: photos, tg_oldest_date: oldestDate, updated: Date.now() });
+    if (incremental) Object.assign(project, { tg_count: count, updated: Date.now() });
+    else Object.assign(project, { tg_before: oldest, tg_count: count, tg_oldest_date: oldestDate, updated: Date.now() });
     await store.saveProject(project);
-    onProgress?.({ messages: count, photos, oldest: incremental ? project.tg_oldest_date || "" : oldestDate });
+    onProgress?.({ messages: count, oldest: incremental ? project.tg_oldest_date || "" : oldestDate });
 
     if (incremental && reachedKnown) { finished = true; break; }
     if ((limit && count >= limit) || oldest <= 1 || !page.nextBefore) { finished = true; break; }
@@ -3495,33 +3626,25 @@ export async function runTelegram(project, { onProgress, shouldStop, incremental
   project.status = finished ? "ready" : "paused";
   if (finished) project.finished = Date.now();
   await store.saveProject(project);
-  onProgress?.({ messages: count, photos, oldest: project.tg_oldest_date || "", done: finished });
+  onProgress?.({ messages: count, oldest: project.tg_oldest_date || "", done: finished });
   return project;
 }
 
 #### FILE: src/tgExport.js ####
 /* Word + PDF output for a downloaded Telegram channel (messages oldest -> newest). */
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, ImageRun, BorderStyle, Bookmark, InternalHyperlink, CharacterSet } from "docx";
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, BorderStyle, Bookmark, InternalHyperlink, CharacterSet } from "docx";
 import { fontBytes, PERSIAN_FONT, fontFaceCss, BODY_FONT_STACK } from "./fonts.js";
 import { run, para, detectRtl, FONT, fixEmbeddedFont } from "./docxBuilder.js";
 import { faNum, faLongDate } from "./format.js";
 
-const MAX_COUNT = 1000; // messages per part (text only); photos are limited by MAX_BYTES below
-const MAX_BYTES = 12_000_000; // photo bytes per part (keeps Word/PDF generation light)
+const MAX_COUNT = 1000; // default messages per part (can be changed in Settings)
 
-export function partitionMessages(msgs) {
+/* fill every part up to the limit (only the last one may be shorter) */
+export function partitionMessages(msgs, maxPerPart = MAX_COUNT) {
+  const max = Math.max(1, Math.floor(maxPerPart) || MAX_COUNT);
   const sorted = [...msgs].sort((a, b) => a.msg_id - b.msg_id);
   const parts = [];
-  let cur = { msgs: [], bytes: 0 };
-  for (const m of sorted) {
-    if (cur.msgs.length && (cur.msgs.length >= MAX_COUNT || cur.bytes + (m.media_bytes || 0) > MAX_BYTES)) {
-      parts.push(cur);
-      cur = { msgs: [], bytes: 0 };
-    }
-    cur.msgs.push(m);
-    cur.bytes += m.media_bytes || 0;
-  }
-  if (cur.msgs.length) parts.push(cur);
+  for (let i = 0; i < sorted.length; i += max) parts.push({ msgs: sorted.slice(i, i + max) });
   return parts;
 }
 
@@ -3539,44 +3662,14 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 
 export function notes(m) {
   const n = [];
-  if (m.video) n.push("[ویدیو — در آرشیو فقط تصویر بندانگشتی ذخیره می‌شود]");
+  if (m.has_photo) n.push("[تصویر — این آرشیو فقط متن را نگه می‌دارد]");
+  if (m.video) n.push("[ویدیو — این آرشیو فقط متن را نگه می‌دارد]");
   if (m.voice) n.push("[پیام صوتی]");
   if (m.sticker) n.push("[استیکر]");
   if (m.file) n.push("[فایل: " + m.file + "]");
   if (m.poll) n.push("[نظرسنجی: " + m.poll + "]");
   if (m.unsupported) n.push("[رسانهٔ پشتیبانی‌نشده در پیش‌نمایش وب]");
   return n;
-}
-
-/* ---------- image helpers ---------- */
-export async function prepImage(buf, type) {
-  try {
-    let blob = new Blob([buf], { type });
-    const bmp = await createImageBitmap(blob);
-    let w = bmp.width, h = bmp.height;
-    let outType = /png/.test(type) ? "png" : "jpg";
-    if (!/image\/(png|jpe?g)/.test(type)) {
-      const c = document.createElement("canvas");
-      c.width = w; c.height = h;
-      c.getContext("2d").drawImage(bmp, 0, 0);
-      blob = await new Promise((r) => c.toBlob(r, "image/png"));
-      if (!blob) return null;
-      outType = "png";
-    }
-    const data = new Uint8Array(await blob.arrayBuffer());
-    const maxW = 430, maxH = 520;
-    const k = Math.min(1, maxW / w, maxH / h);
-    return { data, type: outType, width: Math.max(20, Math.round(w * k)), height: Math.max(20, Math.round(h * k)) };
-  } catch (_e) {
-    return null;
-  }
-}
-
-function toBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  return btoa(bin);
 }
 
 /* ---------- cover (shared text for Word and PDF) ---------- */
@@ -3590,7 +3683,7 @@ function coverInfo(project, parts) {
 }
 
 /* ---------- Word ---------- */
-export async function buildTgDocx({ project, parts, partIndex, media, onProgress }) {
+export async function buildTgDocx({ project, parts, partIndex, onProgress }) {
   const part = parts[partIndex];
   const c = coverInfo(project, parts);
   const nameRtl = detectRtl(c.name, true);
@@ -3642,12 +3735,6 @@ export async function buildTgDocx({ project, parts, partIndex, media, onProgress
       if (m.link.title) { const r = detectRtl(m.link.title, true); children.push(para(run(m.link.title, { size: 21, bold: true, color: "17625A", rtl: r }), { after: 20, rtl: r })); }
       if (m.link.url) children.push(para(run(m.link.url, { ltr: true, size: 18, color: "17625A" }), { after: 80, rtl: false }));
     }
-    for (const ph of m.photos || []) {
-      const entry = media[ph.key];
-      const img = entry ? await prepImage(entry.buf, entry.type) : null;
-      if (!img) continue;
-      children.push(para(new ImageRun({ type: img.type, data: img.data, transformation: { width: img.width, height: img.height }, altText: { title: "photo", description: "photo", name: "photo" } }), { center: true, after: 100 }));
-    }
     // thin separator line under each message
     children.push(new Paragraph({ spacing: { after: 160 }, border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: "DDD6C5", space: 4 } }, children: [new TextRun({ text: "", font: FONT, size: 8 })] }));
     done += 1;
@@ -3666,7 +3753,7 @@ export async function buildTgDocx({ project, parts, partIndex, media, onProgress
 }
 
 /* ---------- PDF (HTML that Android prints straight to a PDF file) ---------- */
-export function buildTgHtml({ project, parts, partIndex, media }) {
+export function buildTgHtml({ project, parts, partIndex }) {
   const part = parts[partIndex];
   const c = coverInfo(project, parts);
   const body = [];
@@ -3692,10 +3779,6 @@ export function buildTgHtml({ project, parts, partIndex, media }) {
     String(m.text || "").split("\n").forEach((line) => { if (line.trim()) h += `<p dir="auto">${esc(line.trim())}</p>`; });
     notes(m).forEach((n) => { h += `<p class="note">${esc(n)}</p>`; });
     if (m.link && (m.link.title || m.link.url)) h += `<p dir="auto" class="lk"><b>${esc(m.link.title)}</b><br><span class="u">${esc(m.link.url)}</span></p>`;
-    for (const ph of m.photos || []) {
-      const e = media[ph.key];
-      if (e) h += `<img src="data:${e.type};base64,${toBase64(e.buf)}" />`;
-    }
     body.push(h + `</div>`);
   }
   return `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><title>${esc(c.name)}</title><style>` +
@@ -3709,8 +3792,7 @@ export function buildTgHtml({ project, parts, partIndex, media }) {
     `.month{font-size:18pt;color:#123f39;margin:22px 0 8px;border-bottom:2px solid #123f39}` +
     `.msg{padding:8px 0 10px;border-bottom:1px solid #ddd6c5}.meta{font-size:9pt;color:#7a8683;margin-bottom:3px}` +
     `.note{color:#8a9492;font-style:italic;font-size:10.5pt}.lk .u{direction:ltr;unicode-bidi:isolate;color:#17625a;font-size:9pt}` +
-    `img{display:block;max-width:100%;max-height:420px;margin:8px auto}` +
-    `</style></head><body>${body.join("")}</body></html>`;
+        `</style></head><body>${body.join("")}</body></html>`;
 }
 
 #### FILE: src/main.js ####
@@ -3743,19 +3825,13 @@ import logoUrl from "./assets/logo.jpg";
 const app = document.getElementById("app");
 const S = {
   view: "home", menu: false, projects: [], project: null, running: false, stop: false,
-  progress: null, error: "", imageMode: "text", parts: null, pages: null, msg: "", status: "", busy: "", update: null, mode: "site",
+  progress: null, error: "", parts: null, pages: null, msg: "", status: "", busy: "", update: null, mode: "site",
   downloads: [], storageEst: null,
 };
 
 const STATUS = { extracting: "در حال استخراج", ready: "کامل", paused: "متوقف", discovering: "در حال پیمایش سایت", discovered: "منتظر انتخاب سقف", downloading: "در حال دانلود" };
 const TG_LIMITS = [500, 1000, 5000, 20000, 100000];
 const LIMITS = [500, 1000, 2000, 5000, 10000, 25000, 50000, 100000, 150000, 200000, 250000, 500000];
-const IMAGE_MODES = [
-  ["text", "بدون تصویر — فقط متن"],
-  ["featured", "فقط تصویر شاخص"],
-  ["auto", "خودکار (تا ۸ تصویر در هر مقاله)"],
-  ["all", "همهٔ تصاویر (کندتر و حجیم)"],
-];
 const KIND_LABEL = { docx: "Word", pdf: "PDF", epub: "EPUB" };
 const SLOGAN = "فراکسینتوم؛ جایی که عظمت مسلمانان از خاطره‌ی تاریخ، به نیروی آینده تبدیل می‌شود.";
 
@@ -3787,7 +3863,7 @@ function homeHtml() {
     <div class="card">
       <div class="row between"><div class="title grow">${esc(p.site_name || p.domain)}</div><span class="chip">${STATUS[p.status] || p.status}</span></div>
       <div class="mut ltr">${esc(p.site_url)}</div>
-      <div class="mut">${p.kind === "tg" ? `${faNum(p.tg_count || 0)} پیام — ${faNum(p.tg_photos || 0)} عکس` : p.max_pages ? `${faNum(p.extracted || 0)} از ${faNum(Math.min(p.max_pages, p.discovered || 0))} صفحه استخراج شد` : `${faNum(p.discovered || 0)} صفحه در سایت یافت شد`}${p.failed ? ` — ${faNum(p.failed)} ناموفق` : ""}</div>
+      <div class="mut">${p.kind === "tg" ? `${faNum(p.tg_count || 0)} پیام` : p.max_pages ? `${faNum(p.extracted || 0)} از ${faNum(Math.min(p.max_pages, p.discovered || 0))} صفحه استخراج شد` : `${faNum(p.discovered || 0)} صفحه در سایت یافت شد`}${p.failed ? ` — ${faNum(p.failed)} ناموفق` : ""}</div>
       <div class="row" style="margin-top:10px"><button data-act="open" data-id="${p.id}">باز کردن</button><button class="dan" data-act="del" data-id="${p.id}">حذف</button></div>
     </div>`).join("");
   const tgForm = `<div class="card">
@@ -3795,11 +3871,10 @@ function homeHtml() {
       <input id="tgurl" class="ltr" placeholder="https://t.me/channelname  یا  @channelname" />
       <label style="margin-top:10px">تعداد پیام</label>
       <select id="tglimit"><option value="0">همهٔ پیام‌های کانال</option>${TG_LIMITS.map((n) => `<option value="${n}">آخرین ${faNum(n)} پیام</option>`).join("")}</select>
-      <label style="margin-top:10px"><input id="tgmedia" type="checkbox" checked style="width:auto;margin-left:8px" />دانلود عکس‌ها (حجم بیشتر)</label>
       <label style="margin-top:10px">تأخیر بین درخواست‌ها (برای فشار نیاوردن به سایت)</label>
       <select id="delay">${delayOptions(st.delay)}</select>
       <div class="row" style="margin-top:12px"><button class="grow" data-act="tgnew">دانلود کانال</button></div>
-      <div class="note">فقط کانال‌های عمومی که پیش‌نمایش وب دارند (نشانی t.me/s/…) پشتیبانی می‌شوند؛ کانال خصوصی نه. ویدیوها دانلود نمی‌شوند و فقط تصویر بندانگشتی‌شان می‌آید. هنگام دانلود برنامه را باز نگه دارید.</div>
+      <div class="note">فقط کانال‌های عمومی که پیش‌نمایش وب دارند (نشانی t.me/s/…) پشتیبانی می‌شوند؛ کانال خصوصی نه. فقط متن پیام‌ها آرشیو می‌شود؛ عکس و ویدیو دانلود نمی‌شوند. هنگام دانلود برنامه را باز نگه دارید.</div>
       <div id="msg"></div>
     </div>`;
   const siteForm = `<div class="card">
@@ -3808,6 +3883,8 @@ function homeHtml() {
       <label style="margin-top:10px"><input id="robots" type="checkbox" ${st.robots ? "checked" : ""} style="width:auto;margin-left:8px" />رعایت robots.txt سایت</label>
       <label style="margin-top:10px">تأخیر بین درخواست‌ها (برای فشار نیاوردن به سایت)</label>
       <select id="delay">${delayOptions(st.delay)}</select>
+      <label style="margin-top:10px">روش دریافت صفحه‌ها</label>
+      <select id="fmode"><option value="auto" selected>خودکار (پیشنهادی)</option><option value="browser">همیشه با مرورگر داخلی (کندتر؛ برای سایت‌های سخت‌گیر یا جاوااسکریپتی)</option></select>
       <div class="row" style="margin-top:12px"><button class="grow" data-act="new">پیمایش سایت و شمارش صفحات</button></div>
       <div class="note">ابتدا کل سایت پیمایش و تعداد صفحات شمرده می‌شود؛ بعد سقف تعداد صفحات را خودتان انتخاب می‌کنید. همهٔ کار روی خود گوشی انجام می‌شود و هنگام پیمایش باید برنامه را باز نگه دارید.</div>
       <div id="msg"></div>
@@ -3856,11 +3933,16 @@ function ceilingHtml() {
   </div>`;
 }
 
+function refetchEmptyHtml(p) {
+  if (S.running || p.kind === "tg" || !(p.extracted > 0) || !["ready", "paused"].includes(p.status)) return "";
+  return `<div class="row" style="margin-top:8px"><button class="sec grow" data-act="refetch-empty">بازدریافت صفحه‌های بدون متن</button></div><div class="mut" style="margin-top:4px">صفحه‌هایی که پیش‌تر به‌خاطر پاسخ خالی یا مسدود سایت «بدون متن» ثبت شده‌اند دوباره از سایت گرفته می‌شوند.</div>`;
+}
+
 function incrementalHtml(p) {
   const li = p.last_incremental;
   const info = li ? `<div class="mut" style="margin-top:6px">آخرین به‌روزرسانی: ${faNum(li.added || 0)} صفحهٔ جدید${li.changed ? ` و ${faNum(li.changed)} صفحهٔ تغییرکرده` : ""}</div>` : "";
-  if (S.running || p.status !== "ready") return info;
-  return `<div class="row" style="margin-top:10px"><button class="sec grow" data-act="incr">به‌روزرسانی افزایشی (دانلود صفحات جدید)</button></div>${info}`;
+  if (S.running || p.status !== "ready") return info + refetchEmptyHtml(p);
+  return `<div class="row" style="margin-top:10px"><button class="sec grow" data-act="incr">به‌روزرسانی افزایشی (دانلود صفحات جدید)</button></div>${info}${refetchEmptyHtml(p)}`;
 }
 
 function projectHtml() {
@@ -3890,20 +3972,18 @@ function projectHtml() {
       </div>
       ${incrementalHtml(p)}
       ${S.error ? `<div class="note err">${esc(S.error)}</div>` : ""}
+      ${p.last_error && !S.running ? `<div class="note err">${esc(p.last_error)}</div>` : ""}
     </div>
     ${ceilingHtml()}
     ${ready ? `<div class="card">
       <b>خروجی نهایی</b>
-      <label style="margin-top:10px">حالت تصاویر</label>
-      <select id="imode" ${S.busy ? "disabled" : ""}>${IMAGE_MODES.map(([v, l]) => `<option value="${v}" ${v === S.imageMode ? "selected" : ""}>${l}</option>`).join("")}</select>
       <div class="row" style="margin-top:10px"><button class="grow" data-act="prepare" ${S.busy || S.running ? "disabled" : ""}>آماده‌سازی خروجی</button></div>
       ${parts}
       <hr/>
       <div class="row"><button class="sec grow" data-act="xml" ${S.busy ? "disabled" : ""}>نقشهٔ سایت (XML)</button><button class="sec grow" data-act="csv" ${S.busy ? "disabled" : ""}>فهرست لینک‌ها (CSV)</button></div>
       <div id="status" class="mut" style="margin-top:8px">${esc(S.status)}</div>
       ${S.msg ? `<div class="note">${esc(S.msg)}</div>` : ""}
-      ${S.imageMode !== "text" ? `<div class="note warn">در PDF همهٔ تصاویر دیده می‌شود؛ در Word هم تصاویر جاسازی می‌شود اما کند و حجیم‌تر است.</div>` : ""}
-      <div class="note">با زدن هر دکمه، فایل مستقیم در پوشهٔ Download/FRAXINETUM ذخیره می‌شود و در «دانلودها» (منوی کناری) با تاریخ می‌ماند. هر بخش تا ${faNum(pagesPerPart(S.imageMode))} صفحه است و پُر پُر تقسیم می‌شود.</div>
+      <div class="note">با زدن هر دکمه، فایل مستقیم در پوشهٔ Download/FRAXINETUM ذخیره می‌شود و در «دانلودها» (منوی کناری) با تاریخ می‌ماند. هر بخش تا ${faNum(pagesPerPart())} صفحه است و پُر پُر تقسیم می‌شود.</div>
     </div>` : ""}`;
 }
 
@@ -3911,7 +3991,6 @@ function tgProjectHtml() {
   const p = S.project;
   const pr = S.progress || {};
   const count = pr.messages ?? p.tg_count ?? 0;
-  const photos = pr.photos ?? p.tg_photos ?? 0;
   const oldest = pr.oldest || p.tg_oldest_date || "";
   const oldestFa = oldest ? new Date(oldest).toLocaleDateString("fa-IR", { year: "numeric", month: "long" }) : "—";
   const parts = S.parts
@@ -3926,7 +4005,7 @@ function tgProjectHtml() {
       <div class="row between"><div class="title grow">${esc(p.site_name || p.tg_user)}</div><span class="chip">${STATUS[p.status] || p.status}</span></div>
       <div class="mut ltr">${esc(p.site_url)}</div>
       <div style="margin-top:6px"><button class="sec" data-act="rename">ویرایش نام کانال</button></div>
-      <div id="prog"><div class="stats" style="grid-template-columns:1fr 1fr 1fr"><div><b>${faNum(count)}</b><span>پیام</span></div><div><b>${faNum(photos)}</b><span>عکس</span></div><div><b>${esc(oldestFa)}</b><span>قدیمی‌ترین پیام</span></div></div></div>
+      <div id="prog"><div class="stats" style="grid-template-columns:1fr 1fr"><div><b>${faNum(count)}</b><span>پیام</span></div><div><b>${esc(oldestFa)}</b><span>قدیمی‌ترین پیام</span></div></div></div>
       <div class="row" style="margin-top:12px">
         ${S.running ? `<button class="dan" data-act="stop">توقف</button>` : p.status !== "ready" ? `<button data-act="tgstart">${p.tg_started ? "ادامهٔ دانلود" : "شروع دانلود"}</button>` : ""}
       </div>
@@ -3940,7 +4019,7 @@ function tgProjectHtml() {
       ${parts}
       <div id="status" class="mut" style="margin-top:8px">${esc(S.status)}</div>
       ${S.msg ? `<div class="note">${esc(S.msg)}</div>` : ""}
-      <div class="note">پیام‌ها از قدیم به جدید و به‌ترتیب ماه چیده می‌شوند. چون عکس‌ها حجیم‌اند، کانال به بخش‌های کوچک‌تر تقسیم می‌شود و هر بخش را جدا می‌سازید.</div>
+      <div class="note">پیام‌ها از قدیم به جدید و به‌ترتیب ماه چیده می‌شوند. کانال به بخش‌های پُر تقسیم می‌شود و هر بخش را جدا می‌گیرید.</div>
     </div>` : ""}`;
 }
 
@@ -4024,7 +4103,7 @@ async function newProject() {
   try { host = bareHost(raw); new URL(raw); } catch (_e) { if (msg) msg.innerHTML = `<div class="note err">نشانی معتبر نیست.</div>`; return; }
   const project = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-    respect_robots: document.getElementById("robots").checked, delay_ms: Number(document.getElementById("delay").value) || 500,
+    respect_robots: document.getElementById("robots").checked, fetch_mode: document.getElementById("fmode").value, delay_ms: Number(document.getElementById("delay").value) || 500,
     site_url: raw, domain: host, site_name: "", max_pages: 0,
     status: "discovering", created: Date.now(), discovered: 0, extracted: 0, failed: 0,
     seeded: false, discovery_done: false, next_n: 0,
@@ -4056,6 +4135,18 @@ async function runPhase(kind, retry = false) {
   S.running = false; S.parts = null; S.progress = null; render();
 }
 
+async function refetchEmpty() {
+  const all = await store.loadPages(S.project.id);
+  const empty = all.filter((p) => p.status === "extracted" && !p.word_count && p.order_index < (S.project.max_pages || 0));
+  if (!empty.length) { showToast({ title: "صفحهٔ بدون متنی پیدا نشد", text: "همهٔ صفحه‌های استخراج‌شده متن دارند.", kind: "ok" }); return; }
+  empty.forEach((p) => { p.status = "pending"; p.error = ""; });
+  await store.savePages(empty);
+  S.project.extracted = Math.max(0, (S.project.extracted || 0) - empty.length);
+  S.project.status = "extracting";
+  await store.saveProject(S.project);
+  runPhase("extract");
+}
+
 async function chooseCeilingAndExtract() {
   const v = document.getElementById("ceil").value;
   S.project.max_pages = v === "all" ? S.project.discovered : Number(v);
@@ -4072,8 +4163,7 @@ async function newTelegram() {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), kind: "tg", delay_ms: Math.max(700, Number(document.getElementById("delay").value) || 700),
     site_url: `https://t.me/${user}`, domain: user, tg_user: user, site_name: "",
     tg_limit: Number(document.getElementById("tglimit").value) || 0,
-    tg_media: document.getElementById("tgmedia").checked,
-    status: "downloading", created: Date.now(), tg_count: 0, tg_photos: 0,
+    status: "downloading", created: Date.now(), tg_count: 0,
   };
   await store.saveProject(project);
   await openProject(project.id);
@@ -4094,7 +4184,7 @@ async function runTg(incremental = false) {
         const el = document.getElementById("prog");
         if (el) {
           const fa = p.oldest ? new Date(p.oldest).toLocaleDateString("fa-IR", { year: "numeric", month: "long" }) : "—";
-          el.innerHTML = `<div class="stats" style="grid-template-columns:1fr 1fr 1fr"><div><b>${faNum(p.messages)}</b><span>پیام</span></div><div><b>${faNum(p.photos)}</b><span>عکس</span></div><div><b>${esc(fa)}</b><span>قدیمی‌ترین پیام</span></div></div>`;
+          el.innerHTML = `<div class="stats" style="grid-template-columns:1fr 1fr"><div><b>${faNum(p.messages)}</b><span>پیام</span></div><div><b>${esc(fa)}</b><span>قدیمی‌ترین پیام</span></div></div>`;
         }
       },
     });
@@ -4127,13 +4217,11 @@ async function tgExportPart(i, kind) {
     await runDownload({
       name: `${slug}${suffix}.${ext}`, mime: MIME[ext], project: S.project, label: `بخش ${faNum(i + 1)} (${KIND_LABEL[ext]})`,
       make: async (progress) => {
-        const keys = part.msgs.flatMap((m) => (m.photos || []).map((ph) => ph.key));
-        const media = await store.getMediaMap(keys, (n, t) => setStatus(`بارگذاری عکس‌ها: ${faNum(n)} از ${faNum(t)}`));
         const on = (n, t) => { setStatus(`ساخت ${ext.toUpperCase()}: ${faNum(n)} از ${faNum(t)}`); progress(n, t); };
-        if (kind === "tgepub") return { blob: await buildTgEpub({ project: S.project, parts: S.parts, partIndex: i, media, onProgress: on }) };
-        if (kind === "tgword") return { blob: await buildTgDocx({ project: S.project, parts: S.parts, partIndex: i, media, onProgress: on }) };
+        if (kind === "tgepub") return { blob: await buildTgEpub({ project: S.project, parts: S.parts, partIndex: i, onProgress: on }) };
+        if (kind === "tgword") return { blob: await buildTgDocx({ project: S.project, parts: S.parts, partIndex: i, onProgress: on }) };
         setStatus("در حال ساخت PDF…");
-        return { html: buildTgHtml({ project: S.project, parts: S.parts, partIndex: i, media }) };
+        return { html: buildTgHtml({ project: S.project, parts: S.parts, partIndex: i }) };
       },
     });
     S.msg = `بخش ${faNum(i + 1)} (${faNum(part.msgs.length)} پیام) ذخیره شد.`;
@@ -4150,7 +4238,7 @@ async function prepare() {
     S.pages = all.filter((p) => p.order_index < (S.project.max_pages || 0));
     const sections = groupSections(S.pages);
     numberSections(sections);
-    const per = pagesPerPart(S.imageMode);
+    const per = pagesPerPart();
     S.parts = partitionSections(sections, per);
     S.msg = S.parts.length > 1
       ? `${faNum(S.pages.length)} صفحه در ${faNum(S.parts.length)} بخش آماده شد (هر بخش تا ${faNum(per)} صفحه)؛ هر بخش را جدا بگیرید.`
@@ -4172,7 +4260,6 @@ async function exportPart(i, kind) {
   const ext = { word: "docx", epub: "epub", pdf: "pdf" }[kind];
   const slug = documentSlug(S.project);
   const suffix = S.parts.length > 1 ? `-part-${i + 1}` : "";
-  let stats = null;
   try {
     await runDownload({
       name: `${slug}${suffix}.${ext}`, mime: MIME[ext], project: S.project, label: `بخش ${faNum(i + 1)} (${KIND_LABEL[ext]})`,
@@ -4181,20 +4268,18 @@ async function exportPart(i, kind) {
         const on = (n, t) => { setStatus(`ساخت ${ext.toUpperCase()}: ${faNum(n)} از ${faNum(t)}`); progress(n, t); };
         if (kind === "word") {
           setStatus("در حال ساخت فایل Word…");
-          const r = await buildDocxBlob({ project: S.project, parts: S.parts, partIndex: i, imageMode: S.imageMode, onProgress: on });
-          stats = r.stats;
+          const r = await buildDocxBlob({ project: S.project, parts: S.parts, partIndex: i, onProgress: on });
           return { blob: r.blob };
         }
         if (kind === "epub") {
           setStatus("در حال ساخت EPUB…");
-          return { blob: await buildSiteEpub({ project: S.project, parts: S.parts, partIndex: i, imageMode: S.imageMode, onProgress: on }) };
+          return { blob: await buildSiteEpub({ project: S.project, parts: S.parts, partIndex: i, onProgress: on }) };
         }
         setStatus("در حال ساخت PDF… (برای بخش‌های بزرگ چند دقیقه طول می‌کشد)");
-        return { html: buildPartHtml({ project: S.project, parts: S.parts, partIndex: i, imageMode: S.imageMode }) };
+        return { html: buildPartHtml({ project: S.project, parts: S.parts, partIndex: i }) };
       },
     });
-    S.msg = `بخش ${faNum(i + 1)} (${faNum(S.parts[i].pageCount)} صفحه) ذخیره شد.` +
-      (stats && S.imageMode !== "text" ? ` تصاویر: ${faNum(stats.embedded)} جاسازی شد، ${faNum(stats.skipped)} نشد.` : "");
+    S.msg = `بخش ${faNum(i + 1)} (${faNum(S.parts[i].pageCount)} صفحه) ذخیره شد.`;
   } catch (e) {
     S.msg = "ساخت فایل ناموفق بود: " + String((e && e.message) || e);
   }
@@ -4285,6 +4370,7 @@ app.addEventListener("click", async (ev) => {
   if (act === "discover") return runPhase("discover");
   if (act === "extract") return chooseCeilingAndExtract();
   if (act === "extract-resume") return runPhase("extract");
+  if (act === "refetch-empty") return refetchEmpty();
   if (act === "retry") return runPhase("extract", true);
   if (act === "stop") { S.stop = true; return; }
   if (act === "prepare") return prepare();
@@ -4295,7 +4381,6 @@ app.addEventListener("click", async (ev) => {
 
 app.addEventListener("change", (ev) => {
   const t = ev.target;
-  if (t.id === "imode") { S.imageMode = t.value; S.parts = null; render(); return; }
   if (t.dataset && t.dataset.set) { const n = Number(t.value); setSetting(t.dataset.set, Number.isNaN(n) ? t.value : n); render(); return; }
   if (t.dataset && t.dataset.setchk) { setSetting(t.dataset.setchk, !!t.checked); }
 });
